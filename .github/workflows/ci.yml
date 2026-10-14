@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pipeline:
+    name: pipeline (Node, DynamoDB Local)
+    runs-on: ubuntu-latest
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:2.5.3
+        ports: ["8000:8000"]
+    defaults:
+      run:
+        working-directory: services/pipeline
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: services/pipeline/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+        env:
+          DYNAMODB_ENDPOINT: http://localhost:8000
+
+  royalty-service:
+    name: royalty-service (Java)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/royalty-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+      - run: ./mvnw -B verify
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-royalty-service
+          path: services/royalty-service/target/surefire-reports/
+
+  web:
+    name: web (Vue)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  simulator:
+    name: simulator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cd tools/simulator && npm test
+
+  terraform:
+    name: terraform
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive
+      - run: mkdir -p ../../services/pipeline/dist && terraform init -backend=false && terraform validate
+
+  e2e:
+    name: end-to-end (exactly-once under duplicate delivery)
+    needs: [pipeline, royalty-service, web]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: docker compose up --build -d --wait
+      - run: ./scripts/e2e.sh
+        env:
+          EVENTS: "20000"
+      - if: failure()
+        run: docker compose logs
+      - if: always()
+        run: docker compose down -v

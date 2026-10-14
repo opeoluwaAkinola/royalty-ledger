@@ -1,0 +1,93 @@
+# Whole system locally: `docker compose up --build -d --wait`, then open http://localhost:8088
+# AWS services are emulated: DynamoDB Local for DynamoDB, ElasticMQ for SQS.
+name: royalty-ledger
+
+x-aws-local: &aws-local
+  AWS_REGION: us-west-2
+  AWS_ACCESS_KEY_ID: local
+  AWS_SECRET_ACCESS_KEY: local
+  DYNAMODB_ENDPOINT: http://dynamodb:8000
+  SQS_ENDPOINT: http://elasticmq:9324
+  TABLE_NAME: royalty-ledger
+  QUEUE_URL: http://elasticmq:9324/000000000000/plays
+  DLQ_URL: http://elasticmq:9324/000000000000/plays-dlq
+
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:2.5.3
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/home/dynamodblocal/data"]
+    user: root
+    volumes: [ddbdata:/home/dynamodblocal/data]
+    ports: ["127.0.0.1:${DYNAMODB_PORT:-18000}:8000"]
+
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.6.9
+    volumes: [./deploy/local/elasticmq.conf:/opt/elasticmq.conf:ro]
+    ports: ["127.0.0.1:${SQS_PORT:-19324}:9324"]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: royalties
+      POSTGRES_USER: royalties
+      POSTGRES_PASSWORD: royalties
+    volumes: [pgdata:/var/lib/postgresql/data]
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U royalties"]
+      interval: 5s
+      retries: 10
+
+  # One-shot: creates the DynamoDB table (Terraform does this in AWS).
+  setup:
+    build: ./services/pipeline
+    command: ["npm", "run", "setup"]
+    environment: *aws-local
+    depends_on: [dynamodb]
+    restart: on-failure
+
+  ingest:
+    build: ./services/pipeline
+    command: ["npm", "run", "ingest"]
+    environment:
+      <<: *aws-local
+      PORT: "8090"
+    ports: ["8090:8090"]
+    depends_on: [elasticmq]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8090/health"]
+      interval: 5s
+      retries: 10
+
+  aggregator:
+    build: ./services/pipeline
+    command: ["npm", "run", "aggregator"]
+    environment:
+      <<: *aws-local
+      CONCURRENCY: "8"
+    depends_on:
+      setup: { condition: service_completed_successfully }
+      elasticmq: { condition: service_started }
+
+  royalty-service:
+    build: ./services/royalty-service
+    environment:
+      <<: *aws-local
+      DB_URL: jdbc:postgresql://postgres:5432/royalties
+      DB_USER: royalties
+      DB_PASSWORD: royalties
+    ports: ["8085:8085"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      setup: { condition: service_completed_successfully }
+
+  web:
+    build: ./web
+    environment:
+      API_URL: http://royalty-service:8085
+    ports: ["8088:8080"]
+    depends_on: [royalty-service]
+
+volumes:
+  pgdata:
+  ddbdata:

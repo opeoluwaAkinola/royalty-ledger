@@ -1,0 +1,10 @@
+{
+  "name": "simulator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Generates realistic streaming play events and sends them to the ingest API",
+  "type": "module",
+  "bin": { "simulate": "src/simulate.js" },
+  "scripts": { "start": "node src/simulate.js", "test": "node --test" },
+  "engines": { "node": ">=20" }
+}
